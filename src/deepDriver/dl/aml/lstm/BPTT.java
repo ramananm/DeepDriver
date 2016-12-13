@@ -16,6 +16,10 @@ public class BPTT implements IBPTT {
 	LSTMConfigurator cfg;	
 	int firstLstmPos = 1;
 	
+	//New CRF Layer
+	CRFLayer crfLayer;
+	boolean isCRF;
+	
 	Context cxt;
 	Context deltaCxt;
 	public BPTT(LSTMConfigurator cfg) {
@@ -34,6 +38,8 @@ public class BPTT implements IBPTT {
 		_preCxtAa = new double[cfg.layers[firstLstmPos].getRNNNeuroVos().length];
 		
 		this.enableUseCellAa = cfg.enableUseCellAa;
+		this.crfLayer = cfg.crfLayer;
+		this.isCRF = cfg.crf;
 	}
 	
 	LstmAttention attention;
@@ -96,6 +102,61 @@ public class BPTT implements IBPTT {
 			}
 		}
 		return results;
+	}
+	
+	/**
+	 * New fTT method for CRF Layer
+	 */
+	protected double fTTCRF(double [][] sample, double [][] target) {
+		double[][] zZ = fTTZz(sample);
+		crfLayer.initDelta(sample.length);
+		double cost = crfLayer.forward(zZ, target);
+		return cost;
+	}
+	
+	/**
+	 * New fTT method during inference stage, find optimal sequence
+	 */
+	protected int[] fTTInfer(double[][] sample) {
+		double[][] zZ = fTTZz(sample);
+		// double[] z = retreiveTopLayerZzs();
+		// Update the delta of CRF Layer
+		crfLayer.initDelta(sample.length);
+		int[] path = crfLayer.predict(zZ);
+		return path;
+	}
+	
+	protected double [][] fTTZz(double [][] sample) {
+		this.sample = sample;
+		for (int i = 0; i < sample.length; i++) {
+			t = i;
+			feature = sample[t];			
+			for (int j = 0; j < cfg.layers.length; j++) {
+				layerPos = j;
+				cfg.layers[j].fTT(this);
+			}
+		}
+		IRNNNeuroVo [] nvs = cfg.layers[cfg.layers.length - 1].getRNNNeuroVos();
+		double [][] results = new double[t + 1][nvs.length];
+		double [][] zZ = new double[t + 1][nvs.length];
+		for (int i = 0; i < results.length; i++) {
+			results[i] = new double[nvs.length];
+			for (int j = 0; j < results[i].length; j++) {
+				results[i][j] = nvs[j].getNvTT()[i].aA;
+				zZ[i][j] = nvs[j].getNvTT()[i].zZ;
+			}
+		}
+		return zZ;
+	}
+	
+	/**
+	 * fTT for gradient check 
+	 */
+	
+	protected double fTTCheck(double[][] zZ, double [][] target, CRFLayer crfLayer) {
+		crfLayer.initDelta(sample.length);
+		double cost = crfLayer.forward(zZ, target);
+		return cost;
 	}
 	
 	double error;
@@ -196,8 +257,17 @@ public class BPTT implements IBPTT {
 	int tLength;
 	
 	int ngram = 0;
+	
+	/**
+	 * Original Method runEpich
+	 * */
 	public double runEpich(double [][] sample, 
-			double [][] targets) {		
+			double [][] targets) {
+		if (isCRF) {
+			double cost = runEpichCRF(sample, targets);
+			return cost;
+		}
+		
 		tLength = sample.length;
 		fTT(sample, false);
 		
@@ -208,7 +278,7 @@ public class BPTT implements IBPTT {
 		}		
 		return error;
 	}
-	
+
 	public double bptt(double [][] targets) {
 		error = 0;
 		for (int i = (targets.length - 1); i >= ngram ; i--) {
@@ -218,6 +288,137 @@ public class BPTT implements IBPTT {
 				error = error + caculateError(target, cfg.layers[cfg.layers.length -1].getRNNNeuroVos(),
 					t);
 			}
+			
+			for (int j = (cfg.layers.length -1); j >= 0 ; j--) {
+				layerPos = j;
+				cfg.layers[j].bpTT(this);
+			}
+		}
+		return error;
+	}	
+	
+	/**
+	 * New Method for LSTM-CRF Model
+	 * */
+	
+	public double runEpichCRF(double [][] sample, 
+			double [][] targets) {		
+		tLength = sample.length;
+		// forward Pass: LSTM -> CRF
+		double cost = fTTCRF(sample, targets);
+		
+		// bptt(targets);
+		bpttCRF(targets);  // pass dZ back
+
+		// Gradient Check, after bptt dA and dZ
+		boolean check = false;
+		if (check) {
+			boolean pass = gradCheck(sample, targets);
+			System.out.println("Gradient Check Passed: " + pass);
+		}		
+		
+		if (!cfg.isMeasureOnly()) {
+			updateWws();
+		}
+		return cost;
+	}
+	
+	/**
+	 * New Method for Gradient Check
+	 * */
+	
+	private boolean gradCheck(double [][] sample, double [][] target) {
+		boolean pass = true;
+		double eps = 0.0001;
+		double threshold = 0.001;
+		double[][] A = copyArray(crfLayer.getA());
+		double[][] dA = copyArray(crfLayer.getdA());	
+		
+		int K = A.length;
+		int T = sample.length;
+		double[][] dA_est = new double[K][K]; // dA estimation
+		CRFLayer crfLayer = new CRFLayer(K);
+		
+		// s_Plus and s_Minus use same zZ
+		double[][] zZ = fTTZz(sample);
+		double[][] dZ = crfLayer.getdZ();
+		double[][] dZ_est = new double[T][K];
+		
+		// Gradient Check AA
+		for (int i = 0; i < K; i++) {
+			for (int j = 0; j < K; j++) {
+				// cur A[i, j] parameters
+				double[][] A_plus = copyArray(A);
+				double[][] A_minus = copyArray(A);
+				A_plus[i][j] += eps;
+				A_minus[i][j] -= eps;
+				
+				// Calc Cost
+				crfLayer.setA(A_plus);
+				double s_plus = fTTCheck(zZ, target, crfLayer);
+				crfLayer.setA(A_minus);
+				double s_minus = fTTCheck(zZ, target, crfLayer);
+				dA_est[i][j] = (s_plus - s_minus)/(2 * eps);
+				//Absolute value because double is not accurate
+				double error = Math.abs((dA[i][j] - dA_est[i][j])/dA_est[i][j]);
+				if (error < threshold){
+					//System.out.println("Check passed " + i + "," + j + ":" + error);
+				} else {
+					System.out.println("Check failed " + i + "," + j + ":" + error);
+					pass = false;
+					return pass;
+				}
+			}
+		}
+		
+		// Gradient Check zZ[t, i]
+		for (int t = 0; t < T; t++) {
+			for (int i = 0; i < K ; i++) {
+				// Refresh for every parameters
+				double[][] zZ_plus = copyArray(zZ);
+				double[][] zZ_minus = copyArray(zZ);
+				zZ_plus[t][i] += eps;
+				zZ_minus[t][i] -= eps;
+				double s_plus = fTTCheck(zZ_plus, target, crfLayer); // original crf layer
+				double s_minus = fTTCheck(zZ_minus, target, crfLayer);
+				dZ_est[t][i] = (s_plus - s_minus)/(2 * eps);
+				double error = Math.abs((dZ[t][i] - dZ_est[t][i])/dZ_est[t][i]);
+				if (error < threshold) {
+					// System.out.println("Check passed " + i + "," + t + " Error:" + error);
+				} else {	
+					System.out.println("Check failed " + i + "," + t + " Error:" + error);
+					pass = false;
+					return pass;
+				}
+			}
+		}
+		return pass;
+	}
+	
+	private double[][] copyArray(double[][] a) {
+		double[][] b = new double[a.length][a[0].length];
+		for (int i = 0; i < a.length; i++)
+			for (int j = 0; j < a[0].length; j++)
+				b[i][j] = a[i][j];
+		return b;
+	}
+	
+	private double[] copyArray(double[] a) {
+		double[] b = new double[a.length];
+		for (int i = 0; i < a.length; i++)
+			b[i] = a[i];
+		return b;
+	}	
+	
+	public double bpttCRF(double [][] targets) {
+		error = 0;
+		// backward Pass: LSTM -> CRF, crf-dZ
+		double[][] dZz = crfLayer.backward(targets);
+		// Objective: Cross-Entropy + crf-dZ
+		for (int i = (targets.length - 1); i >= ngram ; i--) {
+			t = i; // get dZ of time step t
+			target = targets[t];
+			setDzZs4TopLayer(dZz[t]);
 			
 			for (int j = (cfg.layers.length -1); j >= 0 ; j--) {
 				layerPos = j;
@@ -650,19 +851,15 @@ public class BPTT implements IBPTT {
 			RNNNeuroVo [] vos = layer.getRNNNeuroVos();
  			for (int i = 0; i < dzZs4TopLayer.length; i++) {
 				RNNNeuroVo vo = vos[i];
-				vo.getNvTT()[tLength - 1].deltaZz = dzZs4TopLayer[i];
-			} 
+				vo.getNvTT()[tLength - 1].deltaZz += dzZs4TopLayer[i];  // cross entropy + transition
+			}
 		}
 	}
 
 	double learningRate = 0.01;
 	double m = 0.8;
 	double dropOut = 0;
-	public void caculateWithCostFunction(RNNNeuroVo [] vos) {
-		if (dzZs4TopLayer != null) {
-			dzZ4TopLayer();
-			return;
-		}
+	public void caculateWithCostFunction(RNNNeuroVo [] vos) {		
 		if (LSTMConfigurator.SOFT_MAX == cfg.costFunction) {
 			double [] yt = new double[vos.length];
 			double sum = 0;
@@ -690,6 +887,11 @@ public class BPTT implements IBPTT {
 				SimpleNeuroVo vo = vos[i].getNvTT()[t];
 				vo.deltaZz = (vo.aA - target[i]) * f.deActivate(vo.zZ);				
 			}
+		}
+		// Accumulate delta from CRF Layer
+		if (dzZs4TopLayer != null) {
+			dzZ4TopLayer();
+			return;
 		}
 		
 	}
@@ -966,6 +1168,13 @@ public class BPTT implements IBPTT {
 		} else {
 			update = false;
 		}
+		
+		/* Update CRF Layer A transition matrix if isCRF is true
+		 * */
+		if (isCRF) {
+			crfLayer.updateWw(cfg.getLearningRate());
+		}
+
 		for (int i = 0; i < cfg.layers.length; i++) {
 			this.layerPos = i;
 			cfg.layers[i].updateWw(this);
